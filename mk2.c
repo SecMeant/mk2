@@ -9,7 +9,7 @@
 
 #define AUTHOR		"Patryk Wlazłyń"
 #define DESCRIPTION	"Driver for novation mk2 launchpad";
-#define VERSION		"0.1";
+#define VERSION		"0.2";
 
 #define USB_MK2_VENDOR_ID	0x1235
 #define USB_MK2_PRODUCT_ID	0x0069
@@ -30,6 +30,8 @@
 #define MK2_SYSEX_DATAEND1	0x05
 #define MK2_SYSEX_DATAEND2	0x06
 #define MK2_SYSEX_DATAEND3	0x07
+#define MK2_SYSEX_BUTTON	0x09
+#define MK2_SYSEX_SBUTTON	0x0b
 
 static struct usb_driver mk2_driver;
 
@@ -113,6 +115,8 @@ static int mk2_open(struct inode *inode, struct file *file)
 	struct usb_interface *interface;
 	int subminor;
 	int retval = 0;
+
+	printk(KERN_DEBUG "mk2_open\n");
 
 	subminor = iminor(inode);
 
@@ -221,31 +225,22 @@ static void stuff_buffer(char *buf, size_t stuffed_size, const char __user *user
 			break;
 	}
 
-	print_hex_dump(KERN_DEBUG, "mk2 write (raw): ", DUMP_PREFIX_ADDRESS,
-			16, 1, user_buffer, count, true);
-
 	print_hex_dump(KERN_DEBUG, "mk2 write: ", DUMP_PREFIX_ADDRESS,
 			16, 1, buf, stuffed_size, true);
 
 }
 
-static ssize_t mk2_write(struct file *filp, const char __user *user_buffer, size_t count, loff_t *ppos)
+/*
+ * Computes size of the buffer with necessary metadata that wraps user's payload
+ */
+static size_t compute_stuffed_size(size_t payload_size)
 {
-	struct mk2dev *dev;
-	struct mk2_write_endp *endpoint;
-	struct urb *urb = NULL;
-	char *buf = NULL;
-	ssize_t stuffed_size, retval = 0;
-
-	if (count == 0)
-		goto exit;
-
-	count = min(count, USB_MK2_MAX_OUT_LEN);
+	size_t stuffed_size;
 
 	/* Each packet in sysex message must be padded to max width ie. 4.
 	 * Thats why we round data size up first.
 	 * */
-	stuffed_size  = count + MK2_SYSEX_SIZE_ROUND_UP;
+	stuffed_size  = payload_size + MK2_SYSEX_SIZE_ROUND_UP;
 
 	/* Calculate number of packets */
 	stuffed_size /= MK2_SYSEX_PACKET_SIZE;
@@ -253,6 +248,25 @@ static ssize_t mk2_write(struct file *filp, const char __user *user_buffer, size
 	/* Get total data size with stuffed bytes between packets */
 	stuffed_size *= MK2_STUFFED_PACKET_SIZE;
 
+	return stuffed_size;
+}
+
+static ssize_t mk2_write(struct file *filp, const char __user *user_buffer_, size_t count, loff_t *ppos)
+{
+	struct mk2dev *dev;
+	struct mk2_write_endp *endpoint;
+	struct urb *urb = NULL;
+	char *buf = NULL;
+	char *user_buffer = NULL;
+	ssize_t retval = 0;
+	size_t stuffed_size;
+
+	if (count == 0)
+		goto exit;
+
+	count = min(count, USB_MK2_MAX_OUT_LEN);
+
+	stuffed_size = compute_stuffed_size(count);
 
 	dev = filp->private_data;
 	endpoint = &dev->write_endp;
@@ -292,8 +306,14 @@ static ssize_t mk2_write(struct file *filp, const char __user *user_buffer, size
 		goto error;
 	}
 
-	if (unlikely(!access_ok(user_buffer, count))) {
+	if (unlikely(!access_ok(user_buffer_, count))) {
 		retval = -EINVAL;
+		goto error;
+	}
+
+	user_buffer = memdup_user(user_buffer_, count);
+	if (IS_ERR(user_buffer)) {
+		retval = PTR_ERR(user_buffer);
 		goto error;
 	}
 
@@ -323,11 +343,13 @@ static ssize_t mk2_write(struct file *filp, const char __user *user_buffer, size
 
 	usb_free_urb(urb);
 
-	return stuffed_size;
+	return count;
 
 error_unanchor:
 	usb_unanchor_urb(urb);
 error:
+	if (user_buffer)
+		kfree(user_buffer);
 	if (urb) {
 		usb_free_coherent(dev->udev, stuffed_size, buf, urb->transfer_dma);
 		usb_free_urb(urb);
@@ -359,6 +381,11 @@ static void mk2_read_bulk_callback(struct urb *urb)
 	} else {
 		dev->read_endp.buffer.filled = urb->actual_length;
 	}
+
+	printk(KERN_DEBUG "mk2 read (size): %u\n", urb->actual_length);
+	print_hex_dump(KERN_DEBUG, "mk2 read (raw): ", DUMP_PREFIX_ADDRESS,
+			16, 1, dev->read_endp.buffer.data, urb->actual_length, true);
+
 	dev->read_endp.requested_read = 0;
 	spin_unlock_irqrestore(&dev->read_endp.err_lock, irqstate);
 	wake_up_interruptible(&dev->read_endp.wait_queue);
@@ -369,13 +396,15 @@ static int mk2_request_read(struct mk2_read_endp *endpoint, size_t count)
 	struct mk2dev *dev;
 	int retval;
 
+	printk(KERN_DEBUG "%s: count: %lu\n", __func__, count);
+
 	dev = container_of(endpoint, struct mk2dev, read_endp);
 
 	usb_fill_bulk_urb(endpoint->urb,
 			dev->udev,
 			usb_rcvbulkpipe(dev->udev, endpoint->address),
 			endpoint->buffer.data,
-			min(endpoint->buffer.size, count),
+			endpoint->buffer.size,
 			mk2_read_bulk_callback,
 			dev);
 
@@ -402,6 +431,75 @@ static int mk2_request_read(struct mk2_read_endp *endpoint, size_t count)
 	return retval;
 }
 
+static int parse_buffered_data(struct mk2_read_buffer *read_buffer, char __user *user_buffer, size_t user_size)
+{
+	const size_t leftover = read_buffer->filled - read_buffer->copied;
+	unsigned rb_index = 0; // index into read_buffer
+	unsigned rem_size = user_size;
+	int retval;
+
+	// We should be sanitizing this at the very beginning of the syscall
+	BUG_ON(user_size == 0);
+
+	// We should never enter parse_buffered_data without leftover data
+	BUG_ON(leftover == 0);
+
+	retval = 0;
+	while (rb_index < leftover) {
+		unsigned batch_size;
+		switch (read_buffer->data[rb_index] & 0x0f) {
+			case MK2_SYSEX_MOREDATA:
+			case MK2_SYSEX_BUTTON:
+			case MK2_SYSEX_SBUTTON:
+				batch_size = 3;
+				break;
+
+			case MK2_SYSEX_DATAEND1:
+				batch_size = 1;
+				break;
+
+			case MK2_SYSEX_DATAEND2:
+				batch_size = 2;
+				break;
+
+			case MK2_SYSEX_DATAEND3:
+				batch_size = 0;
+				break;
+
+			default:
+				// Data we got from device doesn't make sense
+				// or we messud up during parsing or our
+				// internal caches
+				return -EFAULT;
+		}
+
+		if (rem_size < batch_size)
+			break;
+
+		// Metadata is telling us that we should have more data in the
+		// payload than we have.  It doesn't make any sense, something
+		// went horribly wrong.
+		//
+		// TODO: perhaps we should close user file pointer and reset
+		// the device
+		if (unlikely(rb_index + MK2_STUFFED_PACKET_SIZE > leftover))
+			return -EFAULT;
+
+		// Copy payload to user
+		if (copy_to_user(user_buffer, read_buffer->data + read_buffer->copied + rb_index + 1, batch_size))
+			return -EFAULT;
+
+		retval      += batch_size;
+		rb_index    += MK2_STUFFED_PACKET_SIZE;
+		user_buffer += batch_size;
+		rem_size    -= batch_size;
+	}
+
+	read_buffer->copied += rb_index;
+
+	return retval;
+}
+
 static ssize_t mk2_read(struct file *filp, char __user *user_buffer, size_t count, loff_t *ppos)
 {
 	struct mk2dev *dev;
@@ -413,7 +511,8 @@ static ssize_t mk2_read(struct file *filp, char __user *user_buffer, size_t coun
 	dev = filp->private_data;
 	endpoint = &dev->read_endp;
 
-	if (!count)
+	// TODO: add support for smaller reads
+	if (count < MK2_SYSEX_PACKET_SIZE)
 		return -EINVAL;
 
 	retval = mutex_lock_interruptible(&endpoint->io_mutex);
@@ -436,6 +535,7 @@ retry:
 			goto exit;
 		}
 
+		printk(KERN_DEBUG "%s: waiting\n", __func__);
 		retval = wait_event_interruptible(endpoint->wait_queue,
 						(!endpoint->requested_read));
 						// not needed parenthesis ?
@@ -458,19 +558,17 @@ retry:
 	// Otherwise immediately start read_request and try again.
 	leftover = endpoint->buffer.filled - endpoint->buffer.copied;
 	if (leftover) {
-		size_t n = min(leftover, count);
+		printk(KERN_DEBUG "%s: got leftover: %lu\n", __func__, leftover);
 
-		if (copy_to_user(user_buffer,
-				 endpoint->buffer.data + endpoint->buffer.copied, n))
-			retval = -EFAULT;
-		else
-			retval = n;
+		retval = parse_buffered_data(&endpoint->buffer, user_buffer, count);
 
-		endpoint->buffer.copied += n;
-
-		if (leftover < count)
-			mk2_request_read(endpoint, count - n);
+		// If user wanted to read more, but it was not in the caches,
+		// then prefetch ahead of time.
+		if (unlikely(retval < count))
+			mk2_request_read(endpoint, compute_stuffed_size(count - retval));
 	} else {
+		printk(KERN_DEBUG "%s: no leftover\n", __func__);
+
 		retval = mk2_request_read(endpoint, count);
 		if (retval < 0)
 			goto exit;
